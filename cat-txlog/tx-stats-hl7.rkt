@@ -1,8 +1,10 @@
 #lang racket
 
-(require "cat-txlog.rkt")
+;; (require "cat-txlog.rkt")
 
-(require (for-syntax racket/syntax))
+(require (for-syntax racket/syntax)
+         openssl/sha1
+         threading)
 
 (module+ test
   (require racket/pretty
@@ -16,6 +18,177 @@
 ;; - val: List of values from HL7. It may be one or more element values, or an
 ;;        entire segment.
 (struct detail (dt io id val) #:transparent)
+
+;;;; Import TxLog
+;; --------------------------------------------------------------------------------------------------
+
+;; No input verification. TxLog or else...
+
+;; read-txlog : TxLog -> (Listof String)
+(define (read-txlog file-path)
+  (~> (file->lines file-path)
+      split-txlines
+      txlines->txlist
+      txlist->records
+      hl7->list))
+
+;; JRN doesn't always split HL7 messages in the TxLog. Make sure new MSH
+;; messages don't start in the middle of the line.
+
+;; split-txlines : (Listof String) -> (Listof String)
+(define (split-txlines txlog)
+  (cond [(empty? txlog) '()]
+        [(regexp-match #px"[^ ] 0b" (first txlog))
+         (cons (part-a (first txlog))
+               (cons (part-b (first txlog))
+                     (split-txlines (rest txlog))))]
+        [else (cons (first txlog) (split-txlines (rest txlog)))]))
+
+;; Assume no more than one \x0b beyond beginning of line
+(define pattern (pregexp "^(.*[^ ]) (0b.*)"))
+
+;; part-x : String -> String
+(define (part-x str match#)
+  (~a (substring str 0 23)
+      (regexp-replace pattern (substring str 23 70) match#)))
+
+;; part-a : String -> String
+(define (part-a str) (part-x str "\\1"))
+
+;; part-b : String -> String
+(define (part-b str) (part-x str "\\2"))
+
+(module+ test
+  (define split-tx0
+    (list
+     "Rx 20170331222104659   54 45 7c 32 7c 7c 7c 44 4f 42 3d 31 30 37 31 39  TE|2|||DOB=10719"
+     "Rx 20170331222104659   35 37 7c 7c 32 30 31 32 30 39 31 38 31 33 35 38  57||201209181358"
+     "Rx 20170331222104659   31 37 2d 30 34 3a 30 30 0d 4e 54 45 7c 33 7c 7c  17-04:00.NTE|3||"
+     "Rx 20170331222104659   7c 44 72 3d 42 69 67 20 54 6f 65 7c 7c 32 30 31  |Dr=Big Toe||201"
+     "Rx 20170331222104659   32 30 39 31 38 31 33 35 38 31 37 2d 30 34 3a 30  20918135817-04:0"
+     "Rx 20170331222104659   30 0d 4e 54 45 7c 34 7c 7c 7c 53 65 78 3d 4f 74  0.NTE|4|||Sex=Ot"
+     "Rx 20170331222104659   68 65 72 7c 7c 32 30 31 32 30 39 31 38 31 33 35  her||20120918135"))
+  (define split-tx1
+    (list
+     "Rx 20170331222055460   30 34 3a 30 30 0d 4e 54 45 7c 35 7c 7c 7c 44 53  04:00.NTE|5|||DS"
+     "Rx 20170331222055460   4e 3d 43 30 32 0d 1c 0d 0b 4d 53 48 7c 5e 7e 5c  N=C02....MSH|^~\\"
+     "Rx 20170331222055460   26 7c 41 62 62 6f 74 74 20 50 6f 69 6e 74 20 6f  &|Abbott Point o"))
+  (test-equal? "Unmixed lines" (split-txlines split-tx0) split-tx0)
+  (test-equal? "part-a" (part-a (second split-tx1)) "Rx 20170331222055460   4e 3d 43 30 32 0d 1c 0d")
+  (test-equal? "part-b" (part-b (second split-tx1)) "Rx 20170331222055460   0b 4d 53 48 7c 5e 7e 5c")
+  (test-equal?
+   "Mixed lines"
+   (split-txlines split-tx1)
+   '("Rx 20170331222055460   30 34 3a 30 30 0d 4e 54 45 7c 35 7c 7c 7c 44 53  04:00.NTE|5|||DS"
+     "Rx 20170331222055460   4e 3d 43 30 32 0d 1c 0d"
+     "Rx 20170331222055460   0b 4d 53 48 7c 5e 7e 5c"
+     "Rx 20170331222055460   26 7c 41 62 62 6f 74 74 20 50 6f 69 6e 74 20 6f  &|Abbott Point o")))
+
+;; txlines->txlist : (Listof String) -> (Listof (List String))
+(define (txlines->txlist txlog)
+  (for/list ([line txlog])
+    (define line-lst (regexp-split #px"\\s{2,}" line))
+    (define time+io-string (string-split (first line-lst)))
+    (define io-string (first time+io-string))
+    (define time-string (string->number (second time+io-string)))
+    (define tx-msg-string (cond [(string=? io-string "XX") (second line-lst)]
+                                [else (hexstr->string (second line-lst))]))
+    (list time-string io-string tx-msg-string)))
+
+(module+ test
+  (define line-xx '("XX 20170110093143816   Listening for Connection"))
+  (define line-start-msg
+    '("Rx 20170110180257640   0b 4d 53 48 7c 5e 7e 5c 26 7c 41 62 62 6f 74 74  .MSH|^~\x5c&|Abbott"))
+  (define line-new-record
+    '("Rx 20170110180257640   0d 4f 52 43 7c 4e 57 0d 4f 42 52 7c 31 7c 7c 7c  .ORC|NW.OBR|1|||"))
+  (define line-end-msg
+    '("Tx 20170110180257979   30 31 0d 1c 0d                                   01..."))
+  (test-equal? "Non-hex Line"
+               (txlines->txlist line-xx)
+               '((20170110093143816 "XX" "Listening for Connection")))
+  (test-equal? "Message Start"
+               (txlines->txlist line-start-msg)
+               '((20170110180257640 "Rx" "MSH|^~\\&|Abbott")))
+  (test-equal? "New Record"
+               (txlines->txlist line-new-record)
+               '((20170110180257640 "Rx" "\nORC|NW\nOBR|1|||")))
+  (test-equal? "Message End"
+               (txlines->txlist line-end-msg)
+               '((20170110180257979 "Tx" "01\n"))))
+
+(define (hexstr->string str)
+  (define (hs->str hs)
+    (bytes->string/utf-8 (bytes-join (map hex-string->bytes (string-split hs)) #"")))
+  (define (r->n str) (regexp-replace* #px"\x0d{1,}" str "\n"))
+  (define (del-cntrl str) (regexp-replace* #px"[\x0b\x1c]" str ""))
+  (define (ns->n str) (regexp-replace* #px"[\n\r]{2,}" str "\n"))
+  (~> (hs->str str) r->n del-cntrl ns->n))
+
+(module+ test
+  (define hx-new-msg "0b 4d 53 48 7c 5e 7e 5c 26 7c 41 62 62 6f 74 74")
+  (define hx-new-record "0d 4f 52 43 7c 4e 57 0d 4f 42 52 7c 31 7c 7c 7c")
+  (test-equal? "Empty String" (hexstr->string "") "")
+  (test-equal? "Multiple Segment Separators" (hexstr->string "0d 0d 0d 0d") "\n")
+  (test-equal? "End of Message" (hexstr->string "0d 1c 0d") "\n")
+  (test-equal? "Start of Message" (hexstr->string hx-new-msg) "MSH|^~\\&|Abbott")
+  (test-equal? "New Records" (hexstr->string hx-new-record) "\nORC|NW\nOBR|1|||"))
+
+(define (txlist->records lst)
+  (cond [(null? lst) '()]
+        [(null? (cdr lst)) (list (first lst))]
+        [(msg-match? (first lst) (second lst))
+         (txlist->records (cons (merge-lines (first lst) (second lst)) (cddr lst)))]
+        [else (cons (first lst) (txlist->records (cdr lst)))]))
+
+(define (merge-records txlog)
+  (cond [(null? txlog) '()]
+        [(null? (cdr txlog)) (list (first txlog))]
+        [(msg-match? (first txlog) (second txlog))
+         (txlist->records (cons (merge-lines (first txlog) (second txlog)) (cddr txlog)))]
+        [else (cons (first txlog) (txlist->records (cdr txlog)))]))
+
+(define (msg-match? l1 l2)
+  (and (= (first l1) (first l2))
+       (string=? (second l1) (second l2))
+       (not (string=? (second l1) "XX"))
+       (not (string-prefix? (third l2) "MSH"))))
+
+(define (merge-lines l1 l2)
+  (cond [(msg-match? l1 l2)
+         (list (first l1)
+               (second l1)
+               (string-append (third l1) (third l2)))]))
+
+(module+ test
+  (define rx1 '(20170110180259198 "Rx" "MSH|^~\\&|Abbott"))
+  (define rx2 '(20170110180259198 "Rx" " Point of Care|A"))
+  (define rx3 '(20170110180257979 "Rx" "MSH|^~\\&|Abbott"))
+  (define tx1 '(20170110180257979 "Tx" "MSH|^~\\&|JResul"))
+  (define tx2 '(20170110180257979 "Tx" "tNet|JResultNet|"))
+  (define xx1 '(20170110180244302 "XX" "Listening for Connection"))
+  (define xx2 '(20170110180250650 "XX" "Made Connection"))
+  (define xx3 '(20170110180244302 "XX" "Made Connection"))
+  (test-equal? "Empty" (txlist->records '()) '())
+  (test-equal? "Single Line" (txlist->records (list rx1)) (list rx1))
+  (test-equal? "Matching"
+               (txlist->records (list rx1 rx2))
+               '((20170110180259198 "Rx" "MSH|^~\\&|Abbott Point of Care|A")))
+  (test-equal? "XX + Tx"
+               (txlist->records (list xx1 tx1))
+               '((20170110180244302 "XX" "Listening for Connection")
+                 (20170110180257979 "Tx" "MSH|^~\\&|JResul")))
+  (test-equal? "Rx + Tx"
+               (txlist->records (list rx1 tx1))
+               '((20170110180259198 "Rx" "MSH|^~\\&|Abbott")
+                 (20170110180257979 "Tx" "MSH|^~\\&|JResul")))
+  (test-equal? "Rx Non-matching Timestamp"
+               (txlist->records (list rx3 rx2))
+               '((20170110180257979 "Rx" "MSH|^~\\&|Abbott")
+                 (20170110180259198 "Rx" " Point of Care|A")))
+  (test-equal? "XX with Matching Timestamp"
+               (txlist->records (list xx1 xx3))
+               '((20170110180244302 "XX" "Listening for Connection")
+                 (20170110180244302 "XX" "Made Connection"))))
 
 ;;;; Structure Data
 ;; --------------------------------------------------------------------------------------------------
@@ -291,7 +464,7 @@
 ;;  - TODO: Filler Order Number (ORU): OBR-3 and/or ORC-3
 (define (report txlog)
   (define pids (hl7-ref txlog 'pid 3))
-  (define separator (string-append "\n\n" (string-repeat 100 "=") "\n\n\n" ))
+  (define separator (string-append "\n\n" (string-repeat 133 "=") "\n\n\n" ))
   (~a (format/pids pids)
       (format/pid-track txlog (pids/detail->list pids))
       (format-msa/aa (report-msa/aa txlog))
@@ -311,7 +484,7 @@
         #:separator "  "))
   (define (format-val lst)
     (cond [(string=? (first lst) "MSA")
-           (~a "─ " (string-join lst "|") #:max-width 42 #:limit-marker "..." #:align 'left)]
+           (~a "─ " (string-join lst "|") #:align 'left)]
           [(= (length lst) 2)
            (~a (~a (first lst) #:width 20) (~a (second lst) #:width 20) #:separator "  ")]
           [else (string-join lst "  ")]))
@@ -325,7 +498,7 @@
                      (format-detail (string-repeat 23 "-")
                                     (string-repeat 2 "-")
                                     (string-repeat 38 "-")
-                                    (string-repeat 42 "-"))
+                                    (string-repeat 64 "-"))
                      #:separator "\n"))
   (~a "Patient ID Message Tracking"
       (for/fold ([str ""]) ([pid (in-list pids)]) ; Per PID
@@ -362,7 +535,7 @@
                                     "Message Type")
                      (format-detail (string-repeat 23 "-")
                                     (string-repeat 2 "-")
-                                    (string-repeat 20 "-")
+                                    (string-repeat 38 "-")
                                     (string-repeat 20 "-")
                                     (string-repeat 20 "-"))
                      #:separator "\n"))
@@ -411,7 +584,7 @@
                               (~a id #:width 38 #:align 'right)
                               (~a ack #:width 2 #:align 'left)
                               (~a ref-id #:width 38 #:align 'right)
-                              (~a text #:max-width 20 #:limit-marker "..." #:align 'left)
+                              (~a text  #:align 'left)
                               #:separator "  "))
                         (define msa-type (sym->str 'ack-type))
                         (define msa-count (length msa))
@@ -424,9 +597,9 @@
                                                           "Text Message")
                                            (format-detail (string-repeat 23 "-")
                                                           (string-repeat 2 "-")
-                                                          (string-repeat 20 "-")
+                                                          (string-repeat 38 "-")
                                                           (string-repeat 2 "-")
-                                                          (string-repeat 20 "-")
+                                                          (string-repeat 38 "-")
                                                           (string-repeat 20 "-"))
                                            #:separator "\n"))
                         (~a (~a "MSA" msa-type "Responses\n\n" #:separator " ")
@@ -466,6 +639,33 @@
 (define (create-detail lst proc)
   (detail (first lst) (second lst) (get-msg-id lst) proc))
 
+(define (datetime< d1 d2)
+  (< (detail-dt d1) (detail-dt d2)))
+
+(define (format-date int)
+  (define dt-str (number->string int))
+  (cond [(equal? (string-length dt-str) 17)
+         (format-date/datetime dt-str)]
+        [else dt-str]))
+
+(define (format-date/datetime dts)
+  (string-append (substring dts 0 4)
+                 "-"
+                 (substring dts 4 6)
+                 "-"
+                 (substring dts 6 8)
+                 " "
+                 (substring dts 8 10)
+                 ":"
+                 (substring dts 10 12)
+                 ":"
+                 (substring dts 12 14)
+                 "."
+                 (substring dts 14)))
+
+(define (string-repeat cnt str)
+  (string-append* (make-list cnt str)))
+
 ;; Convert lowercase symbols and strings to uppercase strings. This allows "MSA"
 ;; to be referred to as 'msa or "msa".
 (define (sym->str s)
@@ -473,12 +673,11 @@
         [(string? s) (string-upcase s)]
         [else s]))
 
-(define (datetime< d1 d2)
-  (< (detail-dt d1) (detail-dt d2)))
-
 (module+ test
-
+  (test-equal? "Date Format" (format-date 20160102030405678) "2016-01-02 03:04:05.678")
+  (test-equal? "Date Format: Unknown" (format-date 20160102) "20160102")
   (test-equal? "Get MsgCtrl ID" (get-msg-id (second tx0)) "1")
+
   ;; (test-equal? "Get MsgCtrl ID: Invalid" (get-msg-id (first tx0)) ...)
 
   (test-equal? "Create Detail" (create-detail (second tx0) (first (third (second tx0))))
