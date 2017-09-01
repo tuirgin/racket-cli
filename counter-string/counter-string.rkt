@@ -51,7 +51,9 @@ of the final marker; e.g. \"*3*5*7*9*12*15*18*21*24*\".\n")
   (marker ">")
   (check-equal? (counter-string 10 "") ">3>5>7>10>")
   (marker "@#$%")
+  (length 2)
   (check-equal? (counter-string 2 "") "@@")
+  (length 10)
   (check-equal? (counter-string 10 "") "@@@@10%$#@"))
 
 (define (finish-counter-string acc)
@@ -75,6 +77,7 @@ of the final marker; e.g. \"*3*5*7*9*12*15*18*21*24*\".\n")
   (> length-string+count+mark (length)))
 
 (module+ test
+  (marker "*")
   (length 1)
   (check-equal? (almost-full? 1 "") #t)
   (length 2)
