@@ -1,0 +1,55 @@
+#+TITLE: counter-string
+#+OPTIONS: ^:nil num:nil toc:nil
+
+Use ~counter-string~ to create self-describing strings like the following:
+
+#+begin_example
+  ,*3*5*7*10*13*16*19*22*25*
+#+end_example
+
+In the above example, the numbers describe the character position of the
+immediately following asterisk. The final asterisk of the example is the 25th
+character. 
+
+One useful application for counter strings is in testing text-fields. If a
+string is truncated, you can easily determine the position at which the
+truncation occurred. 
+
+Let's look at an example. The following is a 64-character counter string.
+
+#+begin_example 
+  ,*3*5*7*9*12*15*18*21*24*27*30*33*36*39*42*45*48*51*54*57*60*63*
+#+end_example
+
+Here is the same string after being truncated to 32 characters:
+
+#+begin_example
+  ,*3*5*7*10*13*16*19*22*25*28*31*3
+#+end_example
+
+* Credit where credit is due
+
+James Bach described counter strings and offered his PerlClip on his blog:
+[[http://www.satisfice.com/blog/archives/22][Counterstrings: Self-Describing Test Data]]. PerlClip is still available as both a
+Perl script and a compiled Windows executable, but it is not suitable for
+command line usage from a Unix shell. My implementation lifts his string
+creation logic and implements it so that it can be called from the command line
+with standard output. It can also be used from a [[https://racket-lang.org/][Racket]] REPL.
+
+* Usage
+
+#+begin_example
+counter-string [ <option> ... ]
+ where <option> is one of
+  --length <length>, -l <length> : Default: 256
+    Specify the length of the counter-string.
+  --marker <marker>, -m <marker> : Default: *
+    Specify the marker character.
+  --help, -h : Show this help
+  -- : Do not treat any remaining argument as a switch (at this level)
+ Multiple single-letter switches can be combined after one `-'; for
+  example: `-h-' is the same as `-h --'
+ 
+Creates a counter-string where the last integer indicates the character position
+of the final marker; e.g. "*3*5*7*9*12*15*18*21*24*".
+#+end_example
