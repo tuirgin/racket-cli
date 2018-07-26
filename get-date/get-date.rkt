@@ -12,7 +12,15 @@
 (define mod-years (make-parameter 0))
 (define mod-months (make-parameter 0))
 (define mod-days (make-parameter 0))
-(define base-date (make-parameter (today)))
+
+(define (date->iso8601 d)
+  (~t d DATE-FORMAT))
+
+(module+ test
+  (check-equal? (date->iso8601 (iso8601->date "2018-06-26"))
+                "2018-06-26"))
+
+(define base-date (make-parameter (date->iso8601 (today))))
 
 (module+ main
   (command-line
@@ -23,7 +31,7 @@
     ("Default: (today)"
      "Date from which to calculate the relative date in ISO 8601 format;"
      "i.e. \"yyyy-mm-dd\"")
-    (base-date (iso8601->date date))]
+    (base-date date)]
    [("--years" "-y")
     years
     ("Default: 0" "Years from current date")
@@ -46,7 +54,7 @@
                   #:years [years (mod-years)]
                   #:months [months (mod-months)]
                   #:days [days (mod-days)])
-  (+days (+months (+years start-date years) months) days))
+  (+days (+months (+years (iso8601->date start-date) years) months) days))
 
 (module+ test
   (check-equal? (get-date) (today))
@@ -58,20 +66,12 @@
                 (-days (today) 1))
   (check-equal? (get-date #:years -3 #:months 5 #:days -90)
                 (-years (+months (-days (today) 90) 5) 3))
-  (check-equal? (get-date #:date (iso8601->date "2018-06-26")
+  (check-equal? (get-date #:date "2018-06-26"
                           #:years -44)
                 (iso8601->date "1974-06-26"))
-  (check-equal? (get-date #:date (iso8601->date "1974-06-26")
+  (check-equal? (get-date #:date "1974-06-26"
                           #:years 44
                           #:months 1
                           #:days 15)
                 (iso8601->date "2018-08-10"))
   )
-
-(define (date->iso8601 d)
-  (~t d DATE-FORMAT))
-
-(module+ test
-  (check-equal? (date->iso8601 (iso8601->date "2018-06-26"))
-                "2018-06-26"))
-
